@@ -267,7 +267,7 @@ class State(rx.State):
     chat_messages: List[ChatMessage] = [
         ChatMessage(
             sender="assistant",
-            text="Hello! I am BidUp AI. I analyze Indian market sector concentration (HHI) and cross-sector volatility shock propagation (PyG GAT). Ask me anything about your portfolio or macroeconomic transmission risks!",
+            text="Hi! I'm BidUp AI. I can help you understand your portfolio — how concentrated it is, which sectors dominate, and how risks in one area can flow into another. Ask me anything about your holdings!",
             time="Just now"
         )
     ]
@@ -279,7 +279,10 @@ class State(rx.State):
     sim_add_ticker: str = "DLF.NS"
     sim_add_quantity: str = "25"
     sim_message: str = ""
-    
+
+    # Portfolio add preview panel
+    show_preview: bool = False
+
     # News Feed State (cached so we don't hammer the API on every render)
     fetched_news: List[NewsItem] = []       # NewsData.io results (populated async)
     news_fetching: bool = False             # True while API call is in-flight
@@ -427,6 +430,106 @@ class State(rx.State):
                 descriptive_signal=f"Your IT holdings ({sec_map['IT']:.1f}% weight) link to global enterprise banking tech budgets."
             ))
         return alerts
+
+    # Portfolio Impact Preview — computed from current manual_ticker + manual_quantity + manual_buy_price
+    @rx.var
+    def preview_stock_name(self) -> str:
+        return STOCK_MAP.get(self.manual_ticker, {}).get("name", self.manual_ticker)
+
+    @rx.var
+    def preview_stock_sector(self) -> str:
+        return STOCK_MAP.get(self.manual_ticker, {}).get("sector", "")
+
+    @rx.var
+    def preview_stock_price(self) -> float:
+        return float(STOCK_MAP.get(self.manual_ticker, {}).get("price", 0.0))
+
+    @rx.var
+    def preview_add_qty(self) -> float:
+        try:
+            v = float(self.manual_quantity)
+            return v if v > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    @rx.var
+    def preview_add_value(self) -> float:
+        try:
+            buy = float(self.manual_buy_price)
+        except Exception:
+            buy = self.preview_stock_price
+        return round(self.preview_add_qty * buy, 2)
+
+    @rx.var
+    def preview_new_total(self) -> float:
+        return round(self.total_current + self.preview_add_value, 2)
+
+    @rx.var
+    def preview_sector_weights(self) -> List[SectorWeight]:
+        if self.preview_new_total == 0 or self.preview_add_qty == 0:
+            return self.sector_breakdown
+        sectors: Dict[str, float] = {}
+        for h in self.holdings:
+            sectors[h.sector] = sectors.get(h.sector, 0.0) + h.current_value
+        sec = self.preview_stock_sector
+        sectors[sec] = sectors.get(sec, 0.0) + self.preview_add_value
+        total = self.preview_new_total
+        res = []
+        for s, v in sectors.items():
+            w = round((v / total) * 100.0, 1)
+            count = sum(1 for h in self.holdings if h.sector == s) + (1 if s == sec else 0)
+            res.append(SectorWeight(sector=s, market_value=round(v, 2), weight_pct=w, holdings_count=count))
+        res.sort(key=lambda x: x.weight_pct, reverse=True)
+        return res
+
+    @rx.var
+    def preview_new_hhi(self) -> float:
+        weights = [s.weight_pct for s in self.preview_sector_weights]
+        if not weights:
+            return self.hhi_score
+        return round(sum(w ** 2 for w in weights), 1)
+
+    @rx.var
+    def preview_hhi_delta(self) -> float:
+        return round(self.preview_new_hhi - self.hhi_score, 1)
+
+    @rx.var
+    def preview_new_level(self) -> str:
+        score = self.preview_new_hhi
+        if score == 0:
+            return "No Holdings"
+        elif score < 1500:
+            return "Well Diversified"
+        elif score <= 2500:
+            return "Moderately Concentrated"
+        else:
+            return "Highly Concentrated"
+
+    @rx.var
+    def preview_new_sector_weight_pct(self) -> float:
+        sec = self.preview_stock_sector
+        for s in self.preview_sector_weights:
+            if s.sector == sec:
+                return s.weight_pct
+        return 0.0
+
+    @rx.var
+    def preview_has_risk_flag(self) -> bool:
+        """True if adding the stock would push any sector above 25% or HHI above 2500."""
+        if not self.show_preview:
+            return False
+        if self.preview_new_hhi > 2500:
+            return True
+        return any(s.weight_pct > 25.0 for s in self.preview_sector_weights)
+
+    @rx.var
+    def preview_risk_flag_reason(self) -> str:
+        if self.preview_new_hhi > 2500:
+            return f"Adding this stock would make your portfolio Highly Concentrated (HHI {self.preview_new_hhi:,.0f} > 2500)."
+        for s in self.preview_sector_weights:
+            if s.weight_pct > 25.0:
+                return f"After adding, {s.sector} would represent {s.weight_pct:.1f}% of your portfolio — above the 25% single-sector concentration threshold."
+        return ""
 
     # News Feed — returns live NewsData.io results when available, curated fallback otherwise
     @rx.var
@@ -856,6 +959,13 @@ class State(rx.State):
         self.selected_stock_ticker = ticker
         self.active_nav = "stocks"
 
+    def toggle_preview(self):
+        """Show or hide the impact preview panel for the currently selected ticker+qty."""
+        self.show_preview = not self.show_preview
+
+    def clear_preview(self):
+        """Hide the preview panel without taking any action."""
+        self.show_preview = False
 
     async def add_manual_holding(self):
         ticker = self.manual_ticker
@@ -911,6 +1021,7 @@ class State(rx.State):
             
         self.portfolio_message = f"Successfully added {qty} shares of {ticker} to your portfolio."
         self.portfolio_error = ""
+        self.show_preview = False
         yield State.fetch_portfolio_news
 
     async def remove_holding(self, ticker: str):
@@ -1090,6 +1201,7 @@ class State(rx.State):
         tickers = list({h.ticker for h in self.holdings})
         try:
             import yfinance as yf
+            import math as _math
             data = yf.download(
                 " ".join(tickers),
                 period="1d",
@@ -1104,13 +1216,19 @@ class State(rx.State):
                 ticker = tickers[0]
                 series = data[close_col] if close_col in data else None
                 if series is not None and not series.empty:
-                    price_map[ticker] = float(series.iloc[-1])
+                    val = float(series.iloc[-1])
+                    # Guard: skip NaN or zero/negative prices
+                    if not _math.isnan(val) and val > 0:
+                        price_map[ticker] = val
             else:
                 for ticker in tickers:
                     try:
                         series = data[close_col][ticker]
                         if not series.empty:
-                            price_map[ticker] = float(series.iloc[-1])
+                            val = float(series.iloc[-1])
+                            # Guard: skip NaN or zero/negative prices — keep last good price
+                            if not _math.isnan(val) and val > 0:
+                                price_map[ticker] = val
                     except (KeyError, TypeError):
                         pass
 
@@ -1119,6 +1237,9 @@ class State(rx.State):
                     updated = []
                     for h in self.holdings:
                         p = price_map.get(h.ticker, h.current_price)
+                        # Final NaN safety — if p is still bad, fall back to catalog price
+                        if _math.isnan(p) or p <= 0:
+                            p = STOCK_MAP.get(h.ticker, {}).get("price", h.current_price) or h.current_price
                         curr_v = round(h.quantity * p, 2)
                         pnl = round(curr_v - h.invested_value, 2)
                         pnl_pct = round((pnl / h.invested_value) * 100, 2) if h.invested_value > 0 else 0.0
@@ -1150,7 +1271,8 @@ class State(rx.State):
     @rx.event(background=True)
     async def send_chat_message(self):
         """Send user query to NVIDIA Nemotron via OpenAI-compatible API.
-        Falls back to a visible error message if the API is unreachable."""
+        Includes full portfolio context (holdings, sector breakdown, HHI, GAT risk alerts),
+        enforces non-advisory compliance, and shows visible errors on failure."""
         query = self.chat_input.strip()
         if not query:
             return
@@ -1163,57 +1285,144 @@ class State(rx.State):
 
         # Build portfolio context
         holdings_summary = ", ".join(
-            f"{h.ticker} ({h.sector}, {h.quantity} shares)"
+            f"{h.ticker} ({h.sector}, {h.quantity} shares, invested ₹{h.invested_value:,.0f}, current ₹{h.current_value:,.0f})"
             for h in self.holdings
         ) or "No holdings yet"
+        sectors_summary = ", ".join(
+            f"{s.sector}: {s.weight_pct:.1f}% (₹{s.market_value:,.0f})"
+            for s in self.sector_breakdown
+        ) or "None"
         alerts_text = " ".join(
             [a.descriptive_signal for a in self.active_gat_alerts]
         ) if self.active_gat_alerts else "No active GAT alerts."
 
         system_prompt = (
-            "You are BidUp AI, a descriptive portfolio analytics assistant for Indian equity markets. "
-            "You explain portfolio concentration (HHI), cross-sector risk propagation (GAT model), "
-            "and macroeconomic transmission in simple terms. "
-            "IMPORTANT COMPLIANCE RULE: You must never give personalised financial, buy, sell, or "
-            "investment advice. If a user asks 'Should I buy X?' or similar, politely explain that "
-            "you only provide descriptive analytics and cannot make recommendations.\n\n"
-            f"User's current portfolio: {holdings_summary}\n"
-            f"HHI Score: {self.hhi_score:.1f} ({self.hhi_level}) — {self.hhi_interpretation}\n"
-            f"Active GAT risk alerts: {alerts_text}"
+            "You are BidUp AI. Analytics assistant for Indian equity portfolios. "
+            "NEVER give buy/sell advice. If asked, say you cannot advise then share the relevant analytics. "
+            "ALWAYS output ONLY this: <answer>3-5 sentence plain English reply with real portfolio numbers</answer>\n\n"
+            f"User portfolio — Holdings: {holdings_summary} | "
+            f"Sector split: {sectors_summary} | "
+            f"Diversification (HHI): {self.hhi_score:.1f} ({self.hhi_level}) | "
+            f"Risk signals: {alerts_text}"
         )
 
+        api_key = NEMOTRON_API_KEY or os.getenv("NEMOTRON_API_KEY", "").strip()
+        if not api_key:
+            error_text = "⚠️ NEMOTRON_API_KEY is not configured in .env. Please set a valid NVIDIA API key."
+            async with self:
+                if self.chat_messages and self.chat_messages[-1].text == "⏳ Thinking…":
+                    self.chat_messages = list(self.chat_messages[:-1]) + [ChatMessage(sender="assistant", text=error_text, time="Just now")]
+                else:
+                    self.chat_messages.append(ChatMessage(sender="assistant", text=error_text, time="Just now"))
+            return
+
         headers = {
-            "Authorization": f"Bearer {NEMOTRON_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": NEMOTRON_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query},
-            ],
-            "temperature": 0.6,
-            "max_tokens": 512,
-        }
+
+        # Candidate models: try configured model first, with automatic fallback if endpoint returns 404
+        candidate_models = [
+            "nvidia/nemotron-3-super-120b-a12b",
+            NEMOTRON_MODEL,
+            "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "meta/llama-3.2-11b-vision-instruct",
+        ]
+
+        import re as _re
+
+        def _extract_answer(raw: str) -> str:
+            """Extract <answer>…</answer> block from raw model output.
+            Falls back gracefully if the model doesn't use the tags."""
+
+            # 1. Primary: parse <answer>...</answer>
+            m = _re.search(r"<answer>(.*?)</answer>", raw, _re.DOTALL | _re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+            # 2. The model used <think>...</think> but forgot <answer> — take everything after </think>
+            m_think = _re.search(r"</think(?:ing)?>(.+)", raw, _re.DOTALL | _re.IGNORECASE)
+            if m_think:
+                after = m_think.group(1).strip()
+                if len(after) > 40:
+                    return after
+
+            # 3. Model wrote a "Here's a thinking process:" block with numbered steps —
+            #    find the last step block which usually contains the draft answer.
+            if _re.search(r"here'?s?\s+a\s+thinking\s+process|let\s+me\s+think", raw, _re.IGNORECASE):
+                step_blocks = _re.split(r"\n\d+\.\s+\*\*", raw)
+                if len(step_blocks) > 1:
+                    last = step_blocks[-1].strip()
+                    # Strip step heading (e.g. "Formulate Response**\n")
+                    last = _re.sub(r"^[^*\n]*\*\*\s*\n?", "", last).strip()
+                    # Strip "- Draft something like:" lead-in and quoted drafts
+                    last = _re.sub(r'^[-*]\s*(draft\s+something\s+like|here\s+is\s+(the|my)|final\s+response)[^:]*:\s*[""]?',
+                                   "", last, flags=_re.IGNORECASE).strip()
+                    if last.startswith('"') and last.endswith('"'):
+                        last = last[1:-1].strip()
+                    if len(last) > 60:
+                        return last
+
+            # 4. Any "Final answer:" / "Response:" marker — take what follows
+            for marker in ["final answer:", "my answer:", "response:",
+                           "here's my response:", "here is my response:", "draft:"]:
+                idx = raw.lower().rfind(marker)
+                if idx != -1:
+                    candidate = raw[idx + len(marker):].strip()
+                    if candidate.startswith('"') and '"' in candidate[1:]:
+                        candidate = candidate[1:candidate.rindex('"')].strip()
+                    if len(candidate) > 60:
+                        return candidate
+
+            # 5. Last resort: if still full of numbered reasoning, take the last paragraph of substance
+            paragraphs = [p.strip() for p in raw.split("\n\n") if len(p.strip()) > 60]
+            if paragraphs:
+                last_para = paragraphs[-1]
+                # Only use if it doesn't look like reasoning (no "**Step" or "Analyze User")
+                if not _re.search(r"\*\*\w+\s+\w+\*\*|Analyze User|Check Compliance|Identify Core", last_para):
+                    return last_para
+
+            # 6. Absolute fallback — raw text (still better than silence)
+            return raw
 
         reply = ""
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    f"{NEMOTRON_BASE_URL}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                reply = data["choices"][0]["message"]["content"].strip()
-        except httpx.HTTPStatusError as e:
-            reply = f"⚠️ AI temporarily unavailable (HTTP {e.response.status_code}). Please retry in a moment."
-        except Exception:
-            reply = "⚠️ AI temporarily unavailable — please retry. (Network or API error)"
+        last_error = ""
+        for model_id in candidate_models:
+            payload = {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+                "temperature": 0.5,
+                "max_tokens": 400,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    resp = await client.post(
+                        f"{NEMOTRON_BASE_URL}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        raw = data["choices"][0]["message"]["content"].strip()
+                        reply = _extract_answer(raw)
+                        break
+                    elif resp.status_code == 404:
+                        last_error = f"HTTP 404 (model '{model_id}' not found on account)"
+                        continue
+                    else:
+                        last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+            except httpx.RequestError as e:
+                last_error = f"Network connection error: {str(e)}"
+            except Exception as e:
+                last_error = f"Unexpected error: {str(e)}"
+
+        if not reply:
+            reply = f"⚠️ AI Assistant Error: {last_error or 'Unable to reach NVIDIA Nemotron API'}. Please verify your network and NEMOTRON_API_KEY."
 
         async with self:
-            # Replace the "Thinking…" placeholder with the real reply
             if self.chat_messages and self.chat_messages[-1].text == "⏳ Thinking…":
                 msgs = list(self.chat_messages[:-1])
                 msgs.append(ChatMessage(sender="assistant", text=reply, time="Just now"))
@@ -1224,6 +1433,7 @@ class State(rx.State):
     async def send_quick_chat(self, prompt_text: str):
         self.chat_input = prompt_text
         yield State.send_chat_message
+
 
     # Paper Trading Execution
     def execute_paper_trade(self):
@@ -1462,10 +1672,14 @@ def portfolio_health_hero() -> rx.Component:
                             width="100%",
                         ),
                         rx.hstack(
-                            rx.badge(f"HHI Score: {State.hhi_score:,.1f}", color_scheme="purple", size="1"),
-                            rx.text("• Lower score indicates healthier dispersion", font_size="0.75rem", color=TEXT_SECONDARY),
+                            rx.badge(f"Score: {State.hhi_score:,.1f}", color_scheme="purple", size="1"),
+                            rx.text("Lower = more spread out", font_size="0.75rem", color=TEXT_SECONDARY),
                             spacing="1",
                             align="center",
+                        ),
+                        rx.text(
+                            "This number summarises how spread out your money is across sectors. Below 1500 is healthy; above 2500 means you're quite concentrated in a few areas.",
+                            font_size="0.73rem", color=TEXT_SECONDARY, font_style="italic",
                         ),
                         spacing="2",
                     ),
@@ -1582,13 +1796,116 @@ def home_view() -> rx.Component:
         legal_banner(),
         # Visual Anchor: Top Portfolio Health Section
         portfolio_health_hero(),
+        # ── Portfolio at a Glance ─────────────────────────────────────────────
+        rx.box(
+            rx.vstack(
+                rx.hstack(
+                    rx.icon(tag="pie_chart", color=ACCENT_COLOR, size=18),
+                    rx.heading("Portfolio at a Glance", font_size="1.05rem", font_weight="700", color=TEXT_HEADLINE),
+                    rx.spacer(),
+                    rx.hstack(
+                        rx.heading(f"₹{State.total_current:,.0f}", font_size="1.1rem", font_weight="800", color=TEXT_HEADLINE),
+                        rx.badge(
+                            f"{State.total_pnl_pct}%",
+                            color_scheme=rx.cond(State.total_pnl >= 0, "green", "red"),
+                            size="1",
+                        ),
+                        spacing="2", align="center",
+                    ),
+                    width="100%", align="center",
+                ),
+                # Top row: sector bars left, summary stats right
+                rx.grid(
+                    # Sector allocation mini-bars
+                    rx.vstack(
+                        rx.text("Sector breakdown", font_size="0.75rem", font_weight="600", color=TEXT_MUTED),
+                        rx.foreach(
+                            State.top_sectors,
+                            lambda s: rx.hstack(
+                                rx.text(s.sector, font_size="0.75rem", color=TEXT_HEADLINE, min_width="130px"),
+                                rx.box(
+                                    rx.box(
+                                        height="10px",
+                                        width=f"{s.weight_pct}%",
+                                        background_color=ACCENT_COLOR,
+                                        border_radius="3px",
+                                        opacity="0.85",
+                                    ),
+                                    background_color=CARD_BORDER_SUBTLE,
+                                    border_radius="3px",
+                                    width="100%",
+                                    flex="1",
+                                    overflow="hidden",
+                                ),
+                                rx.text(f"{s.weight_pct:.0f}%", font_size="0.75rem", font_weight="600", color=ACCENT_COLOR, min_width="36px", text_align="right"),
+                                spacing="2", align="center", width="100%",
+                            ),
+                        ),
+                        spacing="2", width="100%",
+                    ),
+                    # Right-side summary stats
+                    rx.vstack(
+                        rx.hstack(
+                            rx.icon(tag="indian_rupee", size=14, color=TEXT_MUTED),
+                            rx.vstack(
+                                rx.text("Invested", font_size="0.7rem", color=TEXT_MUTED),
+                                rx.text(f"₹{State.total_invested:,.0f}", font_size="0.9rem", font_weight="700", color=TEXT_HEADLINE),
+                                spacing="0",
+                            ),
+                            spacing="1", align="center",
+                        ),
+                        rx.hstack(
+                            rx.icon(tag="trending_up", size=14, color=rx.cond(State.total_pnl >= 0, POSITIVE_COLOR, ALERT_COLOR)),
+                            rx.vstack(
+                                rx.text("Gain / Loss", font_size="0.7rem", color=TEXT_MUTED),
+                                rx.text(
+                                    f"₹{State.total_pnl:,.0f}",
+                                    font_size="0.9rem", font_weight="700",
+                                    color=rx.cond(State.total_pnl >= 0, POSITIVE_COLOR, ALERT_COLOR),
+                                ),
+                                spacing="0",
+                            ),
+                            spacing="1", align="center",
+                        ),
+                        rx.hstack(
+                            rx.icon(tag="layers", size=14, color=TEXT_MUTED),
+                            rx.vstack(
+                                rx.text("Holdings", font_size="0.7rem", color=TEXT_MUTED),
+                                rx.text(f"{State.holdings_count} stocks · {State.sector_count} sectors", font_size="0.9rem", font_weight="700", color=ACCENT_COLOR),
+                                spacing="0",
+                            ),
+                            spacing="1", align="center",
+                        ),
+                        rx.button(
+                            "View Full Portfolio →",
+                            on_click=State.set_nav("portfolio"),
+                            size="1", variant="ghost", color=ACCENT_COLOR, font_size="0.78rem", padding="0",
+                        ),
+                        spacing="3", width="100%", align="start",
+                    ),
+                    columns="2", spacing="6", width="100%",
+                ),
+                spacing="3", width="100%",
+            ),
+            background_color=CARD_BG,
+            border=f"1px solid {CARD_BORDER}",
+            border_radius="14px",
+            padding=SPACE_6,
+            box_shadow=SHADOW_CARD,
+            width="100%",
+            margin_top=SPACE_6,
+        ),
         # Metric Quick Bar (Lightweight, grouped together with breathing room)
         rx.grid(
             rx.box(
                 rx.vstack(
-                    rx.text("Total Portfolio Value", color=TEXT_MUTED, font_size="0.82rem", font_weight="500"),
+                    rx.hstack(
+                        rx.icon(tag="indian_rupee", color=ACCENT_COLOR, size=16),
+                        rx.text("Total Portfolio Value", color=TEXT_MUTED, font_size="0.82rem", font_weight="500"),
+                        spacing="1", align="center",
+                    ),
                     rx.heading(f"₹{State.total_current:,.2f}", color=TEXT_HEADLINE, font_size="1.6rem", font_weight="800"),
-                    rx.text(f"Invested Capital: ₹{State.total_invested:,.2f}", color=TEXT_MUTED, font_size="0.78rem"),
+                    rx.text(f"Invested: ₹{State.total_invested:,.2f}", color=TEXT_MUTED, font_size="0.78rem"),
                     spacing="1",
                 ),
                 background_color=CARD_BG,
@@ -1599,7 +1916,11 @@ def home_view() -> rx.Component:
             ),
             rx.box(
                 rx.vstack(
-                    rx.text("Unrealized Profit & Loss", color=TEXT_MUTED, font_size="0.82rem", font_weight="500"),
+                    rx.hstack(
+                        rx.icon(tag="trending_up", color=rx.cond(State.total_pnl >= 0, POSITIVE_COLOR, ALERT_COLOR), size=16),
+                        rx.text("Your Gain / Loss So Far", color=TEXT_MUTED, font_size="0.82rem", font_weight="500"),
+                        spacing="1", align="center",
+                    ),
                     rx.heading(
                         f"₹{State.total_pnl:,.2f}",
                         color=rx.cond(State.total_pnl >= 0, POSITIVE_COLOR, ALERT_COLOR),
@@ -1607,9 +1928,13 @@ def home_view() -> rx.Component:
                         font_weight="800",
                     ),
                     rx.badge(
-                        f"{State.total_pnl_pct}% Overall",
+                        f"{State.total_pnl_pct}% since you bought",
                         color_scheme=rx.cond(State.total_pnl >= 0, "green", "red"),
                         size="1",
+                    ),
+                    rx.text(
+                        "How much your investments have grown or dropped since you bought — not locked in until you sell.",
+                        color=TEXT_SECONDARY, font_size="0.72rem", font_style="italic",
                     ),
                     spacing="1",
                 ),
@@ -1621,9 +1946,13 @@ def home_view() -> rx.Component:
             ),
             rx.box(
                 rx.vstack(
-                    rx.text("Active Holdings & Assets", color=TEXT_MUTED, font_size="0.82rem", font_weight="500"),
-                    rx.heading(f"{State.holdings_count} Synced Assets", color=ACCENT_COLOR, font_size="1.6rem", font_weight="800"),
-                    rx.text(f"Spread across {State.sector_count} unique sectors", color=TEXT_MUTED, font_size="0.78rem"),
+                    rx.hstack(
+                        rx.icon(tag="layers", color=ACCENT_COLOR, size=16),
+                        rx.text("Stocks in Your Portfolio", color=TEXT_MUTED, font_size="0.82rem", font_weight="500"),
+                        spacing="1", align="center",
+                    ),
+                    rx.heading(f"{State.holdings_count} Stocks", color=ACCENT_COLOR, font_size="1.6rem", font_weight="800"),
+                    rx.text(f"Across {State.sector_count} sectors", color=TEXT_MUTED, font_size="0.78rem"),
                     spacing="1",
                 ),
                 background_color=CARD_BG,
@@ -1657,15 +1986,15 @@ def home_view() -> rx.Component:
                         rx.icon(tag="bot", color=ACCENT_COLOR, size=20),
                         rx.heading("BidUp AI Portfolio Risk Assistant", font_size="1.1rem", font_weight="700", color=TEXT_HEADLINE),
                         rx.spacer(),
-                        rx.badge("PyG GAT + HHI", color_scheme="purple"),
+                        rx.badge("Portfolio AI", color_scheme="purple"),
                         width="100%",
                         align="center",
                     ),
                     # Quick Prompt Chips
                     rx.hstack(
                         rx.button(
-                            "Analyze my HHI concentration",
-                            on_click=State.send_quick_chat("Analyze my HHI concentration"),
+                            "How concentrated is my portfolio?",
+                            on_click=State.send_quick_chat("How concentrated is my portfolio?"),
                             size="1",
                             variant="outline",
                             color=TEXT_MUTED,
@@ -1680,8 +2009,8 @@ def home_view() -> rx.Component:
                             border=f"1px solid {CARD_BORDER}",
                         ),
                         rx.button(
-                            "Summarize GAT risk alerts",
-                            on_click=State.send_quick_chat("Summarize GAT risk alerts"),
+                            "Any risks I should know about?",
+                            on_click=State.send_quick_chat("Are there any cross-sector risk signals in my current portfolio?"),
                             size="1",
                             variant="outline",
                             color=TEXT_MUTED,
@@ -2039,11 +2368,44 @@ def onboarding_view() -> rx.Component:
     )
 
 # --- 2. /portfolio Route ---
+def _sector_color(sector: str) -> str:
+    """Return a color for a given sector label (used in sector bar chart)."""
+    # Reflex cond chains for sector coloring
+    return rx.cond(
+        sector == "IT", "#6246ea",
+        rx.cond(sector == "FMCG", "#16a34a",
+        rx.cond(sector == "Financial Services", "#d97706",
+        rx.cond(sector == "Pharma", "#e45858",
+        rx.cond(sector == "Energy", "#f59e0b",
+        rx.cond(sector == "Automobile", "#0ea5e9",
+        rx.cond(sector == "Metals", "#8b5cf6",
+        rx.cond(sector == "Realty", "#ec4899",
+        rx.cond(sector == "Infra", "#10b981",
+        "#626471")))))))))
+
+
+def _sector_badge_color(sector: str) -> str:
+    """Return a Radix color_scheme string for sector badge."""
+    return rx.cond(
+        sector == "IT", "violet",
+        rx.cond(sector == "FMCG", "green",
+        rx.cond(sector == "Financial Services", "amber",
+        rx.cond(sector == "Pharma", "red",
+        rx.cond(sector == "Energy", "orange",
+        rx.cond(sector == "Automobile", "sky",
+        rx.cond(sector == "Metals", "purple",
+        rx.cond(sector == "Realty", "pink",
+        rx.cond(sector == "Infra", "teal",
+        "gray")))))))))
+
+
 def portfolio_view() -> rx.Component:
     return rx.vstack(
         legal_banner(),
-        # Top Metrics Grid
+
+        # ── Top 3 Metrics ──────────────────────────────────────────────────────
         rx.grid(
+            # Card 1: Total value
             rx.box(
                 rx.vstack(
                     rx.text("Total Market Value", color=TEXT_MUTED, font_size="0.85rem"),
@@ -2052,109 +2414,89 @@ def portfolio_view() -> rx.Component:
                     rx.hstack(
                         rx.cond(
                             State.prices_last_updated != "",
-                            rx.text(
-                                f"Prices as of {State.prices_last_updated}",
-                                font_size="0.72rem",
-                                color=TEXT_MUTED,
-                                font_style="italic",
-                            ),
-                            rx.text(
-                                "Live prices not yet loaded",
-                                font_size="0.72rem",
-                                color=TEXT_MUTED,
-                                font_style="italic",
-                            ),
+                            rx.text(f"Prices as of {State.prices_last_updated}", font_size="0.72rem", color=TEXT_MUTED, font_style="italic"),
+                            rx.text("Live prices not yet loaded", font_size="0.72rem", color=TEXT_MUTED, font_style="italic"),
                         ),
                         rx.cond(
                             State.prices_fetching,
                             rx.spinner(size="1", color=TEXT_MUTED),
-                            rx.button(
-                                "↻ Refresh",
-                                on_click=State.refresh_prices,
-                                size="1",
-                                variant="ghost",
-                                color=TEXT_MUTED,
-                                font_size="0.72rem",
-                                padding="0",
-                            ),
+                            rx.button("↻ Refresh", on_click=State.refresh_prices, size="1", variant="ghost", color=TEXT_MUTED, font_size="0.72rem", padding="0"),
                         ),
-                        spacing="2",
-                        align="center",
-                        width="100%",
+                        spacing="2", align="center", width="100%",
                     ),
                     spacing="1",
                 ),
-                background_color=CARD_BG,
-                border=f"1px solid {CARD_BORDER}",
-                border_radius="12px",
-                padding=SPACE_6,
-                box_shadow=SHADOW_CARD,
+                background_color=CARD_BG, border=f"1px solid {CARD_BORDER}", border_radius="12px", padding=SPACE_6, box_shadow=SHADOW_CARD,
             ),
+            # Card 2: P&L
             rx.box(
                 rx.vstack(
                     rx.text("Unrealized Returns", color=TEXT_MUTED, font_size="0.85rem"),
                     rx.heading(
                         f"₹{State.total_pnl:,.2f}",
                         color=rx.cond(State.total_pnl >= 0, POSITIVE_COLOR, ALERT_COLOR),
-                        font_size="1.8rem",
-                        font_weight="800",
+                        font_size="1.8rem", font_weight="800",
                     ),
                     rx.badge(f"{State.total_pnl_pct}% Overall", color_scheme=rx.cond(State.total_pnl >= 0, "green", "red")),
+                    rx.hstack(
+                        rx.badge(f"{State.holdings_count} Holdings", color_scheme="purple", size="1"),
+                        rx.badge(f"{State.sector_count} Sectors", color_scheme="blue", size="1"),
+                        spacing="2",
+                    ),
                     spacing="1",
                 ),
-                background_color=CARD_BG,
-                border=f"1px solid {CARD_BORDER}",
-                border_radius="12px",
-                padding=SPACE_6,
-                box_shadow=SHADOW_CARD,
+                background_color=CARD_BG, border=f"1px solid {CARD_BORDER}", border_radius="12px", padding=SPACE_6, box_shadow=SHADOW_CARD,
             ),
+            # Card 3: HHI concentration
             rx.box(
                 rx.vstack(
                     rx.hstack(
-                        rx.text("How Spread Out Is Your Portfolio?", color=TEXT_MUTED, font_size="0.85rem", font_weight="500"),
+                        rx.text("Portfolio Concentration (HHI)", color=TEXT_MUTED, font_size="0.85rem", font_weight="500"),
                         rx.icon(tag="pie_chart", size=16, color=ACCENT_COLOR),
-                        spacing="1",
-                        align="center",
+                        spacing="1", align="center",
                     ),
                     rx.heading(
                         State.hhi_level,
                         color=rx.cond(
-                            State.hhi_level == "Well Diversified",
-                            POSITIVE_COLOR,
+                            State.hhi_level == "Well Diversified", POSITIVE_COLOR,
                             rx.cond(State.hhi_level == "Moderately Concentrated", WARNING_COLOR, ALERT_COLOR),
                         ),
-                        font_size="1.4rem",
-                        font_weight="700",
+                        font_size="1.4rem", font_weight="700",
                     ),
                     rx.hstack(
-                        rx.badge(f"HHI Score: {State.hhi_score:,.1f}", color_scheme="purple", size="1"),
-                        rx.text("• Lower is more spread out", font_size="0.75rem", color=TEXT_SECONDARY),
-                        spacing="1",
-                        align="center",
+                        rx.badge(f"HHI: {State.hhi_score:,.1f}", color_scheme="purple", size="1"),
+                        rx.text("• Lower = more diversified", font_size="0.75rem", color=TEXT_SECONDARY),
+                        spacing="1", align="center",
                     ),
+                    rx.text(State.hhi_interpretation, color=TEXT_MUTED, font_size="0.78rem"),
                     spacing="1",
                 ),
-                background_color=CARD_BG,
-                border=f"1px solid {CARD_BORDER}",
-                border_radius="12px",
-                padding=SPACE_6,
-                box_shadow=SHADOW_CARD,
+                background_color=CARD_BG, border=f"1px solid {CARD_BORDER}", border_radius="12px", padding=SPACE_6, box_shadow=SHADOW_CARD,
             ),
-            columns="3",
-            spacing="6",
-            width="100%",
+            columns="3", spacing="6", width="100%",
         ),
-        # Add Holding Form
+
+        # ── Add Stock + Impact Preview Card ────────────────────────────────────
         rx.box(
             rx.vstack(
+                # Header row
                 rx.hstack(
                     rx.icon(tag="circle_plus", color=ACCENT_COLOR, size=20),
-                    rx.heading("Add Stock Holding (50+ Universe)", font_size="1.1rem", font_weight="700", color=TEXT_HEADLINE),
+                    rx.heading("Add Stock to Portfolio", font_size="1.1rem", font_weight="700", color=TEXT_HEADLINE),
                     rx.spacer(),
-                    rx.button("Load 9-Stock Demo Portfolio", on_click=State.load_demo_csv, size="1", variant="outline", color=ACCENT_COLOR, border=f"1px solid {ACCENT_BORDER}"),
-                    width="100%",
-                    align="center",
+                    rx.button(
+                        "Load 9-Stock Demo Portfolio",
+                        on_click=State.load_demo_csv,
+                        size="1", variant="outline", color=ACCENT_COLOR, border=f"1px solid {ACCENT_BORDER}",
+                    ),
+                    width="100%", align="center",
                 ),
+                rx.text(
+                    "Select any NSE stock, enter quantity and buy price, then click Preview Impact to see how it changes your HHI score and sector mix — before committing.",
+                    color=TEXT_MUTED, font_size="0.85rem",
+                ),
+
+                # Input row
                 rx.grid(
                     rx.vstack(
                         rx.text("Search & Select Ticker", font_size="0.8rem", color=TEXT_MUTED),
@@ -2164,61 +2506,227 @@ def portfolio_view() -> rx.Component:
                             placeholder="Type e.g. TCS, RELIANCE, HDFC...",
                             size="2",
                         ),
-                        rx.select(State.filtered_tickers, value=State.manual_ticker, on_change=State.set_manual_ticker, size="2"),
+                        rx.select(
+                            State.filtered_tickers,
+                            value=State.manual_ticker,
+                            on_change=State.set_manual_ticker,
+                            size="2",
+                        ),
                         spacing="1",
                     ),
                     rx.vstack(
                         rx.text("Quantity (Shares)", font_size="0.8rem", color=TEXT_MUTED),
                         rx.input(value=State.manual_quantity, on_change=State.set_manual_quantity, placeholder="e.g. 25", size="2"),
+                        rx.text(f"Market price: ₹{State.preview_stock_price:,.2f} | Sector: {State.preview_stock_sector}", font_size="0.75rem", color=TEXT_SECONDARY),
                         spacing="1",
                     ),
                     rx.vstack(
                         rx.text("Avg Purchase Price (₹)", font_size="0.8rem", color=TEXT_MUTED),
                         rx.input(value=State.manual_buy_price, on_change=State.set_manual_buy_price, placeholder="e.g. 2980.0", size="2"),
+                        rx.text(f"Total add value: ₹{State.preview_add_value:,.2f}", font_size="0.75rem", color=TEXT_SECONDARY),
                         spacing="1",
                     ),
                     rx.vstack(
-                        rx.text("Action", font_size="0.8rem", color="transparent"),
-                        rx.button("Add Holding", on_click=State.add_manual_holding, background_color=ACCENT_COLOR, color="#ffffff", size="2", width="100%"),
-                        spacing="1",
+                        rx.text("Actions", font_size="0.8rem", color="transparent"),
+                        rx.button(
+                            rx.cond(State.show_preview, "▲ Hide Preview", "👁 Preview Impact"),
+                            on_click=State.toggle_preview,
+                            background_color=rx.cond(State.show_preview, CARD_BG, ACCENT_LIGHT),
+                            color=rx.cond(State.show_preview, TEXT_MUTED, ACCENT_COLOR),
+                            border=f"1px solid {ACCENT_BORDER}",
+                            size="2", width="100%",
+                        ),
+                        rx.button(
+                            rx.icon(tag="plus", size=14), " Add to Portfolio",
+                            on_click=State.add_manual_holding,
+                            background_color=ACCENT_COLOR, color="#ffffff",
+                            size="2", width="100%",
+                        ),
+                        spacing="2",
                     ),
-                    columns="4",
-                    spacing="4",
-                    width="100%",
+                    columns="4", spacing="4", width="100%",
                 ),
+
+                # ── Impact Preview Panel (shown when show_preview=True) ─────────
+                rx.cond(
+                    State.show_preview,
+                    rx.box(
+                        rx.vstack(
+                            # Title
+                            rx.hstack(
+                                rx.icon(tag="trending_up", color=ACCENT_COLOR, size=18),
+                                rx.heading(
+                                    f"Impact Preview — Adding {State.preview_add_qty:.0f} × {State.manual_ticker}",
+                                    font_size="1rem", font_weight="700", color=TEXT_HEADLINE,
+                                ),
+                                rx.spacer(),
+                                rx.button(
+                                    "✕",
+                                    on_click=State.clear_preview,
+                                    size="1", variant="ghost", color=TEXT_MUTED,
+                                ),
+                                width="100%", align="center",
+                            ),
+                            rx.divider(border_color=CARD_BORDER_SUBTLE),
+
+                            # HHI before → after comparison
+                            rx.grid(
+                                # Current HHI
+                                rx.box(
+                                    rx.vstack(
+                                        rx.text("Current HHI Score", font_size="0.78rem", color=TEXT_MUTED, font_weight="600"),
+                                        rx.heading(f"{State.hhi_score:,.1f}", font_size="1.6rem", font_weight="800", color=TEXT_HEADLINE),
+                                        rx.badge(State.hhi_level, color_scheme=rx.cond(
+                                            State.hhi_level == "Well Diversified", "green",
+                                            rx.cond(State.hhi_level == "Moderately Concentrated", "amber", "red"),
+                                        ), size="1"),
+                                        spacing="1", align="center",
+                                    ),
+                                    background_color=BG_COLOR,
+                                    border=f"1px solid {CARD_BORDER_SUBTLE}",
+                                    border_radius="10px", padding=SPACE_4, text_align="center",
+                                ),
+                                # Arrow + delta
+                                rx.box(
+                                    rx.vstack(
+                                        rx.text("Change", font_size="0.78rem", color=TEXT_MUTED, font_weight="600"),
+                                        rx.heading(
+                                            rx.cond(State.preview_hhi_delta >= 0, f"+{State.preview_hhi_delta:,.1f}", f"{State.preview_hhi_delta:,.1f}"),
+                                            font_size="1.6rem", font_weight="800",
+                                            color=rx.cond(State.preview_hhi_delta <= 0, POSITIVE_COLOR, rx.cond(State.preview_hhi_delta <= 500, WARNING_COLOR, ALERT_COLOR)),
+                                        ),
+                                        rx.text("→", font_size="1.2rem", color=TEXT_MUTED),
+                                        spacing="0", align="center",
+                                    ),
+                                    text_align="center", padding=SPACE_4,
+                                ),
+                                # New HHI
+                                rx.box(
+                                    rx.vstack(
+                                        rx.text("New HHI Score", font_size="0.78rem", color=TEXT_MUTED, font_weight="600"),
+                                        rx.heading(f"{State.preview_new_hhi:,.1f}", font_size="1.6rem", font_weight="800", color=TEXT_HEADLINE),
+                                        rx.badge(State.preview_new_level, color_scheme=rx.cond(
+                                            State.preview_new_level == "Well Diversified", "green",
+                                            rx.cond(State.preview_new_level == "Moderately Concentrated", "amber", "red"),
+                                        ), size="1"),
+                                        spacing="1", align="center",
+                                    ),
+                                    background_color=rx.cond(
+                                        State.preview_hhi_delta <= 0, POSITIVE_LIGHT,
+                                        rx.cond(State.preview_hhi_delta <= 500, WARNING_LIGHT, ALERT_LIGHT),
+                                    ),
+                                    border=f"1px solid {CARD_BORDER_SUBTLE}",
+                                    border_radius="10px", padding=SPACE_4, text_align="center",
+                                ),
+                                # Sector impact
+                                rx.box(
+                                    rx.vstack(
+                                        rx.text(f"{State.preview_stock_sector} Sector Weight", font_size="0.78rem", color=TEXT_MUTED, font_weight="600"),
+                                        rx.heading(f"{State.preview_new_sector_weight_pct:.1f}%", font_size="1.6rem", font_weight="800", color=ACCENT_COLOR),
+                                        rx.text(f"of ₹{State.preview_new_total:,.0f} new total", font_size="0.75rem", color=TEXT_SECONDARY),
+                                        spacing="1", align="center",
+                                    ),
+                                    background_color=ACCENT_LIGHT,
+                                    border=f"1px solid {ACCENT_BORDER}",
+                                    border_radius="10px", padding=SPACE_4, text_align="center",
+                                ),
+                                columns="4", spacing="3", width="100%",
+                            ),
+
+                            # Risk flag (shown when risky)
+                            rx.cond(
+                                State.preview_has_risk_flag,
+                                rx.hstack(
+                                    rx.icon(tag="triangle_alert", color=ALERT_COLOR, size=16),
+                                    rx.text(State.preview_risk_flag_reason, color=ALERT_COLOR, font_size="0.85rem", font_weight="600"),
+                                    background_color=ALERT_LIGHT,
+                                    border=f"1px solid {ALERT_COLOR}",
+                                    border_radius="8px", padding=SPACE_3,
+                                    width="100%", align="center", spacing="2",
+                                ),
+                            ),
+
+                            # Simulated sector breakdown bar chart
+                            rx.vstack(
+                                rx.text("Simulated Sector Allocation After Add", font_size="0.85rem", font_weight="600", color=TEXT_MUTED),
+                                rx.foreach(
+                                    State.preview_sector_weights,
+                                    lambda sw: rx.vstack(
+                                        rx.hstack(
+                                            rx.text(sw.sector, font_size="0.8rem", font_weight="600", color=TEXT_HEADLINE, min_width="160px"),
+                                            rx.box(
+                                                rx.box(
+                                                    height="14px",
+                                                    width=f"{sw.weight_pct}%",
+                                                    background_color=_sector_color(sw.sector),
+                                                    border_radius="4px",
+                                                    transition="width 0.4s ease",
+                                                ),
+                                                background_color=CARD_BORDER_SUBTLE,
+                                                border_radius="4px",
+                                                width="100%",
+                                                overflow="hidden",
+                                                flex="1",
+                                            ),
+                                            rx.text(f"{sw.weight_pct:.1f}%", font_size="0.8rem", font_weight="700", color=TEXT_HEADLINE, min_width="48px", text_align="right"),
+                                            rx.text(f"₹{sw.market_value:,.0f}", font_size="0.75rem", color=TEXT_MUTED, min_width="90px", text_align="right"),
+                                            spacing="3", align="center", width="100%",
+                                        ),
+                                        spacing="1", width="100%",
+                                    ),
+                                ),
+                                spacing="2", width="100%",
+                            ),
+
+                            # Add button inside preview
+                            rx.hstack(
+                                rx.button(
+                                    rx.icon(tag="plus", size=16), " Confirm & Add to Portfolio",
+                                    on_click=State.add_manual_holding,
+                                    background_color=ACCENT_COLOR, color="#ffffff", size="2",
+                                ),
+                                rx.button("Cancel", on_click=State.clear_preview, variant="ghost", color=TEXT_MUTED, size="2"),
+                                spacing="3",
+                            ),
+
+                            spacing="4", width="100%",
+                        ),
+                        background_color=CARD_BG,
+                        border=f"2px solid {ACCENT_BORDER}",
+                        border_radius="12px",
+                        padding=SPACE_6,
+                        width="100%",
+                    ),
+                ),
+
                 rx.cond(State.portfolio_message != "", rx.text(State.portfolio_message, color=POSITIVE_COLOR, font_size="0.85rem")),
                 rx.cond(State.portfolio_error != "", rx.text(State.portfolio_error, color=ALERT_COLOR, font_size="0.85rem")),
-                spacing="3",
-                width="100%",
+                spacing="4", width="100%",
             ),
-            background_color=CARD_BG,
-            border=f"1px solid {CARD_BORDER}",
-            border_radius="12px",
-            padding=SPACE_6,
-            box_shadow=SHADOW_CARD,
-            width="100%",
+            background_color=CARD_BG, border=f"1px solid {CARD_BORDER}",
+            border_radius="12px", padding=SPACE_6, box_shadow=SHADOW_CARD, width="100%",
         ),
-        # Holdings Table
+
+        # ── Holdings Table ─────────────────────────────────────────────────────
         rx.box(
             rx.vstack(
                 rx.hstack(
                     rx.heading("Active Holdings Breakdown", font_size="1.2rem", font_weight="700", color=TEXT_HEADLINE),
                     rx.spacer(),
                     rx.badge(f"{State.holdings_count} Assets", color_scheme="purple"),
-                    width="100%",
-                    align="center",
+                    width="100%", align="center",
                 ),
                 rx.table.root(
                     rx.table.header(
                         rx.table.row(
                             rx.table.column_header_cell("Stock"),
                             rx.table.column_header_cell("Sector"),
-                            rx.table.column_header_cell("Quantity"),
+                            rx.table.column_header_cell("Qty"),
                             rx.table.column_header_cell("Avg Buy (₹)"),
                             rx.table.column_header_cell("Current (₹)"),
-                            rx.table.column_header_cell("Market Value (₹)"),
+                            rx.table.column_header_cell("Market Value"),
                             rx.table.column_header_cell("Unrealized P&L"),
-                            rx.table.column_header_cell("Action"),
+                            rx.table.column_header_cell("Remove"),
                         )
                     ),
                     rx.table.body(
@@ -2232,7 +2740,13 @@ def portfolio_view() -> rx.Component:
                                         spacing="0",
                                     )
                                 ),
-                                rx.table.cell(rx.badge(h.sector, color_scheme="gray", size="1")),
+                                rx.table.cell(
+                                    rx.badge(
+                                        h.sector,
+                                        color_scheme=_sector_badge_color(h.sector),
+                                        size="1",
+                                    )
+                                ),
                                 rx.table.cell(rx.text(h.quantity, color=TEXT_HEADLINE)),
                                 rx.table.cell(rx.text(f"₹{h.avg_buy_price:,.2f}", color=TEXT_MUTED)),
                                 rx.table.cell(rx.text(f"₹{h.current_price:,.2f}", font_weight="600", color=TEXT_HEADLINE)),
@@ -2256,9 +2770,7 @@ def portfolio_view() -> rx.Component:
                                     rx.button(
                                         rx.icon(tag="trash_2", size=14),
                                         on_click=State.remove_holding(h.ticker),
-                                        size="1",
-                                        variant="soft",
-                                        color_scheme="red",
+                                        size="1", variant="soft", color_scheme="red",
                                     )
                                 ),
                             ),
@@ -2266,19 +2778,60 @@ def portfolio_view() -> rx.Component:
                     ),
                     width="100%",
                 ),
-                spacing="4",
-                width="100%",
+                spacing="4", width="100%",
             ),
-            background_color=CARD_BG,
-            border=f"1px solid {CARD_BORDER}",
-            border_radius="12px",
-            padding=SPACE_6,
-            box_shadow=SHADOW_CARD,
-            width="100%",
+            background_color=CARD_BG, border=f"1px solid {CARD_BORDER}",
+            border_radius="12px", padding=SPACE_6, box_shadow=SHADOW_CARD, width="100%",
         ),
-        spacing="6",
-        width="100%",
-        padding=f"{SPACE_6} {SPACE_8}",
+
+        # ── Live Sector Allocation Bar Chart ───────────────────────────────────
+        rx.cond(
+            State.sector_count > 0,
+            rx.box(
+                rx.vstack(
+                    rx.hstack(
+                        rx.icon(tag="bar_chart_2", color=ACCENT_COLOR, size=20),
+                        rx.heading("Current Sector Allocation", font_size="1.1rem", font_weight="700", color=TEXT_HEADLINE),
+                        rx.spacer(),
+                        rx.badge(f"HHI: {State.hhi_score:,.1f}", color_scheme="purple"),
+                        width="100%", align="center",
+                    ),
+                    rx.text("Each bar represents the % of your total portfolio value in that sector:", color=TEXT_MUTED, font_size="0.85rem"),
+                    rx.foreach(
+                        State.sector_breakdown,
+                        lambda sw: rx.vstack(
+                            rx.hstack(
+                                rx.text(sw.sector, font_size="0.85rem", font_weight="700", color=TEXT_HEADLINE, min_width="170px"),
+                                rx.box(
+                                    rx.box(
+                                        height="18px",
+                                        width=f"{sw.weight_pct}%",
+                                        background_color=_sector_color(sw.sector),
+                                        border_radius="4px",
+                                        transition="width 0.4s ease",
+                                    ),
+                                    background_color=CARD_BORDER_SUBTLE,
+                                    border_radius="4px",
+                                    width="100%",
+                                    overflow="hidden",
+                                    flex="1",
+                                ),
+                                rx.text(f"{sw.weight_pct:.1f}%", font_size="0.85rem", font_weight="700", color=TEXT_HEADLINE, min_width="52px", text_align="right"),
+                                rx.text(f"₹{sw.market_value:,.0f}", font_size="0.78rem", color=TEXT_MUTED, min_width="100px", text_align="right"),
+                                rx.badge(rx.cond(sw.holdings_count == 1, f"{sw.holdings_count} stock", f"{sw.holdings_count} stocks"), color_scheme="gray", size="1", min_width="60px"),
+                                spacing="3", align="center", width="100%",
+                            ),
+                            spacing="1", width="100%",
+                        ),
+                    ),
+                    spacing="3", width="100%",
+                ),
+                background_color=CARD_BG, border=f"1px solid {CARD_BORDER}",
+                border_radius="12px", padding=SPACE_6, box_shadow=SHADOW_CARD, width="100%",
+            ),
+        ),
+
+        spacing="6", width="100%", padding=f"{SPACE_6} {SPACE_8}",
     )
 
 # --- 3. /chat Route ---
@@ -2717,21 +3270,28 @@ def analytics_view() -> rx.Component:
             rx.vstack(
                 rx.hstack(
                     rx.icon(tag="network", color=ACCENT_COLOR, size=24),
-                    rx.heading("PyTorch Geometric (PyG) GAT Risk Model Analytics", font_size="1.4rem", font_weight="700", color=TEXT_HEADLINE),
+                    rx.heading("How Your Sectors Affect Each Other", font_size="1.4rem", font_weight="700", color=TEXT_HEADLINE),
                     rx.spacer(),
-                    rx.badge("9-Sector Network", color_scheme="purple"),
+                    rx.badge("Cross-Sector Risk", color_scheme="purple"),
                     width="100%",
                     align="center",
                 ),
-                rx.text("2-layer Graph Attention Network modeling dynamic, attention-weighted cross-sector volatility shock transmission across Indian Equities:", color=TEXT_MUTED, font_size="0.9rem"),
+                rx.text(
+                    "We track how price swings in one sector tend to spread into others, and flag links that could add risk to your portfolio.",
+                    color=TEXT_MUTED, font_size="0.9rem",
+                ),
                 # Matrix & Alerts Grid
                 rx.grid(
                     rx.box(
                         rx.vstack(
-                            rx.heading("Concentration Score & Interpretation", font_size="1.1rem", font_weight="700", color=TEXT_HEADLINE),
+                            rx.heading("Diversification Score", font_size="1.1rem", font_weight="700", color=TEXT_HEADLINE),
                             rx.heading(f"{State.hhi_score:,.1f}", color=TEXT_HEADLINE, font_size="2rem", font_weight="800"),
                             rx.badge(State.hhi_level, color_scheme="purple"),
                             rx.text(State.hhi_interpretation, color=TEXT_MUTED, font_size="0.85rem"),
+                            rx.text(
+                                "Lower score = money spread across more sectors. Above 2500 means heavy concentration in one area.",
+                                color=TEXT_SECONDARY, font_size="0.78rem", font_style="italic",
+                            ),
                             spacing="2",
                         ),
                         background_color=BG_COLOR,
@@ -2741,7 +3301,11 @@ def analytics_view() -> rx.Component:
                     ),
                     rx.box(
                         rx.vstack(
-                            rx.heading("Active GAT Risk Transmission Alerts", font_size="1.1rem", font_weight="700", color=TEXT_HEADLINE),
+                            rx.heading("Active Risk Signals", font_size="1.1rem", font_weight="700", color=TEXT_HEADLINE),
+                            rx.text(
+                                "Sectors linked to yours that could amplify losses if one of them drops sharply:",
+                                color=TEXT_MUTED, font_size="0.82rem",
+                            ),
                             rx.foreach(
                                 State.active_gat_alerts,
                                 lambda a: rx.box(
@@ -2853,7 +3417,7 @@ def backtest_view() -> rx.Component:
                     width="100%",
                     align="center",
                 ),
-                rx.text("Evaluating Graph Attention Network directional shock prediction across historical Indian market volatility windows:", color=TEXT_MUTED, font_size="0.9rem"),
+                rx.text("Showing how well the sector risk model's past signals matched actual market moves:", color=TEXT_MUTED, font_size="0.9rem"),
                 # Metrics
                 rx.grid(
                     rx.box(
@@ -3122,6 +3686,6 @@ app = rx.App(
 app.add_page(
     index,
     title="BidUp — Portfolio Intelligence & Risk",
-    on_load=[State.refresh_prices, State.fetch_portfolio_news],
+    on_load=[State.fetch_portfolio_news],
 )
 
