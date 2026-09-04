@@ -3689,3 +3689,40 @@ app.add_page(
     on_load=[State.fetch_portfolio_news],
 )
 
+
+
+# --- MONKEY PATCH FOR REFLEX CLOUD STATE MISMATCH ---
+import reflex as rx
+import logging
+
+try:
+    from reflex.app import EventNamespace
+    original_emit_update = EventNamespace.emit_update
+    async def patched_emit_update(self, update, token):
+        if hasattr(update, "delta") and isinstance(update.delta, dict):
+            old_key = "reflex___state____state.bidup_ui____state"
+            new_key = "reflex___state____state.bidup_ui___bidup_ui____state"
+            if old_key in update.delta and new_key not in update.delta:
+                update.delta[new_key] = update.delta.pop(old_key)
+        return await original_emit_update(self, update, token)
+    EventNamespace.emit_update = patched_emit_update
+
+    from reflex_base.event.processor.event_processor import EventProcessor, RegistrationContext
+    original_process_queue = EventProcessor._process_event_queue_entry
+    async def patched_process_event_queue_entry(self, entry, registered_handler=None):
+        if not registered_handler:
+            try:
+                registered_handler = RegistrationContext.get().event_handlers[entry.event.name]
+            except KeyError:
+                alt_name = None
+                if "bidup_ui___bidup_ui____state" in entry.event.name:
+                    alt_name = entry.event.name.replace("bidup_ui___bidup_ui____state", "bidup_ui____state")
+                elif "bidup_ui____state" in entry.event.name:
+                    alt_name = entry.event.name.replace("bidup_ui____state", "bidup_ui___bidup_ui____state")
+                if alt_name and alt_name in RegistrationContext.get().event_handlers:
+                    registered_handler = RegistrationContext.get().event_handlers[alt_name]
+        return await original_process_queue(self, entry, registered_handler)
+    EventProcessor._process_event_queue_entry = patched_process_event_queue_entry
+    logging.info("Applied State Mismatch Monkey Patch Successfully!")
+except Exception as e:
+    logging.error(f"Failed to apply monkey patch: {e}")
