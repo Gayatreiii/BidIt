@@ -1,6 +1,7 @@
 # nixpacks.toml for Railway deployment of Reflex app
 [phases.setup]
-nixPkgs = ["python311", "bun"]
+nixPkgs = ["...", "unzip", "curl", "bun"]
+aptPkgs = ["...", "unzip", "curl"]
 
 [phases.install]
 cmds = [
@@ -10,6 +11,7 @@ cmds = [
 
 [phases.build]
 cmds = [
+    "reflex init",
     "reflex export --frontend-only --no-zip"
 ]
 
