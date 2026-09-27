@@ -1,6 +1,6 @@
 [build]
 builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+dockerfilePath = "Dockerfile.prod"
 
 [deploy]
-startCommand = "reflex run --env prod --backend-port \"${PORT:-8080}\" --backend-host 0.0.0.0"
+startCommand = ""
