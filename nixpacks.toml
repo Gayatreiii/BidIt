@@ -1,18 +1,18 @@
 # nixpacks.toml for Railway deployment of Reflex app
 [phases.setup]
-aptPkgs = ["unzip", "curl", "bun"]
+nixPkgs = ["unzip", "curl"]
 
 [phases.install]
 cmds = [
     "pip install --upgrade pip",
-    "pip install -r requirements.txt"
+    "pip install -r requirements.txt",
+    "curl -fsSL https://bun.sh/install | bash"
 ]
 
 [phases.build]
 cmds = [
-    "reflex init",
-    "reflex export --frontend-only --no-zip"
+    "export PATH=$HOME/.bun/bin:$PATH && reflex init"
 ]
 
 [start]
-cmd = "reflex run --env prod --backend-port ${PORT:-8080} --backend-host 0.0.0.0"
+cmd = "bash start.sh"
