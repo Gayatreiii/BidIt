@@ -1,6 +1,7 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# Install system dependencies: unzip/curl (for bun), nginx (reverse proxy), supervisor (process manager), gettext-base (for envsubst)
+# Install system dependencies
+# NOTE: Changing base to python:3.12-slim forces a full cache bust on Railway's builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     curl \
@@ -9,32 +10,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
-# Install bun (JavaScript runtime for Reflex frontend)
+# Install bun
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:$PATH"
 
-# Set working directory
 WORKDIR /app
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy app source
 COPY . .
 
-# Initialize Reflex project structure
 RUN reflex init
 
-# Pre-build the frontend as static files (so nginx can serve them at runtime without rebuild delay)
-# RAILWAY_PUBLIC_DOMAIN is available at build time, configuring WebSocket URL in the compiled JS
-RUN reflex export --frontend-only --no-zip || true
+# Pre-build frontend at Docker build time (eliminates 90-second startup delay)
+RUN reflex export --frontend-only --no-zip 2>&1 || echo "WARNING: export failed, nginx will serve empty dir"
 
-# Make deploy scripts executable
 RUN chmod +x /app/deploy/start.sh
 
 EXPOSE 8080
 
-# Launch: start.sh sets up nginx config with $PORT then runs supervisord
 CMD ["/bin/bash", "/app/deploy/start.sh"]
