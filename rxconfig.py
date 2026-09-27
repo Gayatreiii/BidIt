@@ -2,8 +2,7 @@ import reflex as rx
 
 config = rx.Config(
     app_name="bidup_ui",
-    api_url="http://localhost:8001",
-    backend_port=8001,
+    cors_allowed_origins=["*"],
     plugins=[
         rx.plugins.SitemapPlugin(),
         rx.plugins.RadixThemesPlugin(

@@ -1,0 +1,17 @@
+# nixpacks.toml for Railway deployment of Reflex app
+[phases.setup]
+nixPkgs = ["python311", "bun"]
+
+[phases.install]
+cmds = [
+    "pip install --upgrade pip",
+    "pip install -r requirements.txt"
+]
+
+[phases.build]
+cmds = [
+    "reflex export --frontend-only --no-zip"
+]
+
+[start]
+cmd = "reflex run --env prod --backend-port ${PORT:-8080} --backend-host 0.0.0.0"
