@@ -1,7 +1,6 @@
 # nixpacks.toml for Railway deployment of Reflex app
 [phases.setup]
-nixPkgs = ["...", "unzip", "curl", "bun"]
-aptPkgs = ["...", "unzip", "curl"]
+aptPkgs = ["unzip", "curl", "bun"]
 
 [phases.install]
 cmds = [
