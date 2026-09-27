@@ -1,0 +1,42 @@
+server {
+    listen ${PORT};
+    server_name _;
+
+    # Reflex WebSocket (state events) - must be proxied to backend
+    location /_event {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    # Reflex file uploads
+    location /_upload {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        client_max_body_size 50m;
+    }
+
+    # Health check / ping
+    location /ping {
+        proxy_pass http://127.0.0.1:8001;
+    }
+
+    # Next.js static assets (long-lived cache)
+    location /_next/ {
+        root /app/.web/export;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # All other requests: serve pre-built static frontend
+    location / {
+        root /app/.web/export;
+        try_files $uri $uri.html $uri/ /index.html;
+        add_header Cache-Control "public, max-age=3600";
+    }
+}
