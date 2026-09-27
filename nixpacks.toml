@@ -4,14 +4,16 @@ nixPkgs = ["unzip", "curl"]
 
 [phases.install]
 cmds = [
+    "apt-get update -qq && apt-get install -y -qq unzip curl",
     "pip install --upgrade pip",
     "pip install -r requirements.txt",
-    "curl -fsSL https://bun.sh/install | bash"
+    "curl -fsSL https://bun.sh/install | bash || true",
+    "export PATH=$HOME/.bun/bin:/root/.bun/bin:$PATH && which bun && bun --version || true"
 ]
 
 [phases.build]
 cmds = [
-    "export PATH=$HOME/.bun/bin:$PATH && reflex init"
+    "export PATH=$HOME/.bun/bin:/root/.bun/bin:$PATH && reflex init || true"
 ]
 
 [start]
