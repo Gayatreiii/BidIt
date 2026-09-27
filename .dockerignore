@@ -1,0 +1,13 @@
+.venv
+.venv311
+.git
+.DS_Store
+__pycache__
+.pytest_cache
+*.py[cod]
+.web
+.states
+.env
+*.db
+docs
+tests

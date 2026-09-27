@@ -1,5 +1,6 @@
 [build]
-buildCommand = "pip install -r requirements.txt"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "bash start.sh"
+startCommand = "reflex run --env prod --backend-port \"${PORT:-8080}\" --backend-host 0.0.0.0"
