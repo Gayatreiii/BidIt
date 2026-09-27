@@ -1,21 +1,25 @@
 #!/bin/bash
 # BidIt Railway startup script
-# This ensures unzip and bun are available at runtime before starting Reflex
-
 set -e
 
 echo "=== BidIt Railway Startup ==="
+echo "[startup] Date: $(date)"
+echo "[startup] User: $(whoami)"
+echo "[startup] PWD: $(pwd)"
+echo "[startup] PORT: ${PORT:-8080}"
+echo "[startup] Python: $(python3 --version 2>&1)"
+echo "[startup] Memory: $(free -h 2>/dev/null || echo 'N/A')"
 
-# Install unzip at runtime (Railway's runtime container doesn't have it by default)
+# Install unzip if missing (Railway runtime may not have it)
 if ! command -v unzip &> /dev/null; then
     echo "[startup] Installing unzip..."
-    apt-get update -qq && apt-get install -y -qq unzip curl
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq unzip curl
     echo "[startup] unzip installed."
 else
-    echo "[startup] unzip already available."
+    echo "[startup] unzip available: $(which unzip)"
 fi
 
-# Add bun to PATH wherever it may have been installed
+# Locate or install bun
 if [ -f "$HOME/.bun/bin/bun" ]; then
     export BUN_INSTALL="$HOME/.bun"
 elif [ -f "/root/.bun/bin/bun" ]; then
@@ -24,18 +28,16 @@ fi
 
 if [ -n "$BUN_INSTALL" ]; then
     export PATH="$BUN_INSTALL/bin:$PATH"
-    echo "[startup] Bun found at $BUN_INSTALL/bin/bun"
+    echo "[startup] Bun found: $BUN_INSTALL/bin/bun ($(bun --version))"
 else
-    echo "[startup] Bun not found, installing via curl..."
+    echo "[startup] Bun not found, installing..."
     curl -fsSL https://bun.sh/install | bash
     export BUN_INSTALL="$HOME/.bun"
     export PATH="$BUN_INSTALL/bin:$PATH"
-    echo "[startup] Bun installed."
+    echo "[startup] Bun installed: $(bun --version)"
 fi
 
-echo "[startup] unzip: $(which unzip)"
-echo "[startup] bun: $(which bun 2>/dev/null || echo 'not in PATH')"
-echo "[startup] PORT: ${PORT:-8080}"
-echo "[startup] Starting Reflex..."
+echo "[startup] Environment ready. Starting Reflex..."
+echo "[startup] Command: reflex run --env prod --backend-port ${PORT:-8080} --backend-host 0.0.0.0"
 
 exec reflex run --env prod --backend-port "${PORT:-8080}" --backend-host 0.0.0.0
