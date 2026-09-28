@@ -3,11 +3,13 @@ import os
 
 # Use Railway's public domain to configure WebSocket connections from the browser.
 # RAILWAY_PUBLIC_DOMAIN is injected by Railway at both build-time and runtime.
-# Locally: omit api_url so Reflex uses its default (http://localhost:8000).
+# Locally: use http://localhost:8000 (Reflex default backend port).
 _domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+_api_url = f"https://{_domain}" if _domain else "http://localhost:8000"
 
 _config_kwargs = dict(
     app_name="bidup_ui",
+    api_url=_api_url,
     cors_allowed_origins=["*"],
     plugins=[
         rx.plugins.SitemapPlugin(),
@@ -21,9 +23,5 @@ _config_kwargs = dict(
         ),
     ],
 )
-
-# Only set api_url in production (Railway injects RAILWAY_PUBLIC_DOMAIN)
-if _domain:
-    _config_kwargs["api_url"] = f"https://{_domain}"
 
 config = rx.Config(**_config_kwargs)
