@@ -3690,3 +3690,71 @@ app.add_page(
 )
 
 
+
+# ---------------------------------------------------------------------------
+# STATE KEY ALIASING PATCH
+# ---------------------------------------------------------------------------
+# Reflex registers handlers as "bidup_ui____state.X"
+# but the compiled frontend sends "bidup_ui___bidup_ui____state.X"
+# These two patches bridge that mismatch in both directions.
+# ---------------------------------------------------------------------------
+import logging as _logging
+
+# Patch 1: Outgoing state deltas (backend -> frontend)
+try:
+    from reflex.app import EventNamespace as _EN
+    _orig_emit = _EN.emit_update
+
+    async def _patched_emit(self, update, token):
+        if hasattr(update, "delta") and isinstance(update.delta, dict):
+            _old = "reflex___state____state.bidup_ui____state"
+            _new = "reflex___state____state.bidup_ui___bidup_ui____state"
+            if _old in update.delta and _new not in update.delta:
+                update.delta[_new] = update.delta.pop(_old)
+        return await _orig_emit(self, update, token)
+
+    _EN.emit_update = _patched_emit
+    _logging.info("[patch1] emit_update aliasing OK")
+except Exception as _e:
+    _logging.warning(f"[patch1] skipped: {_e}")
+
+# Patch 2: Incoming event lookup (frontend -> backend)
+try:
+    from reflex_base.event.processor.event_processor import RegistrationContext as _RC
+
+    class _AH:
+        _L = "bidup_ui___bidup_ui____state"
+        _S = "bidup_ui____state"
+        def __init__(self, d): self._d = d
+        def _alt(self, k): return k.replace(self._L, self._S) if self._L in k else None
+        def __getitem__(self, k):
+            try: return self._d[k]
+            except KeyError:
+                a = self._alt(k)
+                if a: return self._d[a]
+                raise
+        def __contains__(self, k):
+            if k in self._d: return True
+            a = self._alt(k)
+            return bool(a and a in self._d)
+        def __iter__(self): return iter(self._d)
+        def __len__(self): return len(self._d)
+        def get(self, k, default=None):
+            try: return self[k]
+            except KeyError: return default
+
+    class _ARC:
+        def __init__(self, ctx):
+            self._ctx = ctx
+            self.event_handlers = _AH(ctx.event_handlers)
+        def __getattr__(self, n): return getattr(self._ctx, n)
+
+    _orig_get = _RC.get
+
+    @classmethod
+    def _pget(cls): return _ARC(_orig_get())
+
+    _RC.get = _pget
+    _logging.info("[patch2] RegistrationContext aliasing OK")
+except Exception as _e:
+    _logging.warning(f"[patch2] skipped: {_e}")
